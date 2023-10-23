@@ -178,8 +178,8 @@ parseExpr :: Parser LispVal
 parseExpr =
     parseAtom
         <|> parseString
-        <|> parseNumber
         <|> parseBool
+        <|> parseNumber
         <|> parseQuoted
         <|> do
             char '('
@@ -229,11 +229,11 @@ eval env (List (Atom "lambda" : DottedList param varargs : bo)) =
     makeVarArgs varargs env param bo
 eval env (List (Atom "lambda" : varargs@(Atom _) : bo)) =
     makeVarArgs varargs env [] bo
+eval env (List [Atom "load", String filename]) = load filename >>= liftM last . mapM (eval env)
 eval env (List (function : args)) = do
     func <- eval env function
     argVals <- mapM (eval env) args
     apply func argVals
-eval env (List [Atom "load", String filename]) = load filename >>= liftM last . mapM (eval env)
 eval _ badForm = throwError $ BadSpecialForm "Unrecognized special form" badForm
 
 apply :: LispVal -> [LispVal] -> IOThrowsError LispVal
