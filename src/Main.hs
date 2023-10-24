@@ -4,9 +4,12 @@
 module Main where
 
 import Control.Monad.Except
+import Data.Array
+import Data.Complex
 import Data.Functor ((<&>))
 import Data.IORef
 import Data.Maybe (isJust)
+import Data.Ratio
 import Numeric
 import System.Environment
 import System.IO
@@ -30,9 +33,13 @@ data LispVal
     | List [LispVal]
     | DottedList [LispVal] LispVal
     | Number Integer
+    | Float Double
+    | Ratio Rational
+    | Complex (Complex Double)
     | String String
     | Character Char
     | Bool Bool
+    | Vector (Array Int LispVal)
     | PrimitiveFunc ([LispVal] -> ThrowsError LispVal)
     | Func {params :: [String], vararg :: Maybe String, body :: [LispVal], closure :: Env}
     | IOFunc ([LispVal] -> IOThrowsError LispVal)
@@ -101,10 +108,14 @@ escapedChars = do
 
 parseCharacter :: Parser LispVal
 parseCharacter = do
-    char '\''
-    x <- noneOf "\\"
-    char '\''
-    pure $ Character x
+    try $ string "#\\"
+    value <-
+        try (string "newLine" <|> string "space")
+            <|> do x <- anyChar; notFollowedBy alphaNum; pure [x]
+    pure $ Character $ case value of
+        "space" -> ' '
+        "newLine" -> '\n'
+        _ -> head value
 
 parseString :: Parser LispVal
 parseString = do
@@ -169,18 +180,94 @@ parseBin = (string "#b" >> many1 (oneOf "10")) <&> Number . bin2dig
         let old = 2 * digint + (if x == '0' then 0 else 1)
          in bin2dig' old xs
 
+parseFloat :: Parser LispVal
+parseFloat = do
+    x <- many1 digit
+    char '.'
+    y <- many1 digit
+    pure $ Float (fst . head $ readFloat (x ++ "." ++ y))
+
+parseRatio :: Parser LispVal
+parseRatio = do
+    x <- many1 digit
+    char '/'
+    y <- many1 digit
+    pure $ Ratio (read x % read y)
+
+toDouble :: LispVal -> Double
+toDouble (Float f) = realToFrac f
+toDoubel (Number n) = fromIntegral n
+
+parseComplex :: Parser LispVal
+parseComplex = do
+    x <- try (parseFloat <|> parseDecimal1)
+    char '+'
+    y <- try (parseFloat <|> parseDecimal1)
+    char 'i'
+    pure $ Complex (toDouble x :+ toDoubel y)
+
 parseBool :: Parser LispVal
 parseBool = do
     char '#'
     (char 't' >> pure (Bool True)) <|> (char 'f' >> pure (Bool False))
 
+parseQuasiQuoted :: Parser LispVal
+parseQuasiQuoted = do
+    char '`'
+    x <- parseExpr
+    pure $ List [Atom "quasiquoted", x]
+
+parseUnQuote :: Parser LispVal
+parseUnQuote = do
+    char ','
+    x <- parseExpr
+    pure $ List [Atom "unquote", x]
+
+parseUnQuoteSplicing :: Parser LispVal
+parseUnQuoteSplicing = do
+    char ','
+    char '@'
+    x <- parseExpr
+    pure $ List [Atom "unquote-splicing", x]
+
+parseVector Parse LispVal
+parseVector = do
+    arrayValues <- sepBy parseExpr spaces
+    pure $ Vector (listArray (0, (length arrayValues - 1)) arrayValues)
+
+parseAnyList : Parse LispVal
+parseAnyList = do
+    char '('
+    optionalSpaces
+    h <- sepEndBy parseExpr spaces
+    t <- (char '.' >> spaces >> parseExpr) <|> pure (Nil ())
+    optionalSpaces
+    char ')'
+    pure $ case t of
+        Nil () -> List h
+        _ -> DottedList h t
+
 parseExpr :: Parser LispVal
 parseExpr =
     parseAtom
         <|> parseString
-        <|> parseBool
-        <|> parseNumber
+        <|> try parseComplex
+        <|> try parseRatio
+        <|> try parseFloat
+        <|> try parseNumber
+        <|> try parseBool
+        <|> try parseCharacter
         <|> parseQuoted
+        <|> parseQuasiQuoted
+        <|> parseUnQuote
+        <|> parseUnQuoteSplicing
+        <|> try
+            ( do
+                string "#("
+                x <- parseVector
+                char ')'
+                pure x
+            )
         <|> do
             char '('
             x <- try parseList <|> parseDottedList
@@ -214,7 +301,8 @@ eval env (List [Atom "if", predicate, conseq, alt]) = do
     result <- eval env predicate
     case result of
         Bool False -> eval env alt
-        _ -> eval env conseq
+        Bool True -> eval env conseq
+        _ -> throwError $ TypeMismatch "bool" predicate
 eval env (List [Atom "set!", Atom var, form]) =
     eval env form >>= setVar env var
 eval env (List [Atom "define", Atom var, form]) =
@@ -466,6 +554,12 @@ unpackEquals arg1 arg2 (AnyUnpacker unpacker) =
         unpacked2 <- unpacker arg2
         pure $ unpacked1 == unpacked2
         `catchError` const (pure False)
+
+symbol2string, string2symbol :: LispVal -> LispVal
+symbol2string (Atom s) = String s
+symbol2string _ = String ""
+string2symbol (String s) = Atom s
+string2symbol _ = Atom ""
 
 equal :: [LispVal] -> ThrowsError LispVal
 equal [arg1, arg2] = do
